@@ -7,6 +7,7 @@
 
 ## Sumário
 
+0. [Resumo executivo](#resumo-executivo)
 1. [Tecnologias utilizadas](#1-tecnologias-utilizadas)
 2. [Visão geral do projeto](#2-visão-geral-do-projeto)
 3. [Requisitos do case e cobertura](#3-requisitos-do-case-e-cobertura)
@@ -31,6 +32,7 @@
 13. [Estrutura do repositório](#13-estrutura-do-repositório)
 
 ---
+
 ## Resumo executivo
 
 Este projeto implementa um **service desk de TI omnichannel (chat + voz)** no **Amazon Connect** para uma empresa de médio porte, substituindo um help desk sem triagem, em que os colaboradores abriam chamados por e-mail ou ramal, o que gerava fila, falta de priorização e pouca visibilidade dos indicadores.
@@ -56,7 +58,9 @@ O fluxo trata falhas de forma explícita: matrícula não encontrada, erro ao cr
 | Canais | Chat e voz |
 | Região | `us-east-1` |
 | Custo estimado | US$ 11.146/mês (cerca de US$ 0,37 por ligação) |
+
 ---
+
 ## 1. Tecnologias utilizadas
 
 | Tecnologia | Papel no projeto |
@@ -245,92 +249,716 @@ O bloco **Criar caso** usa `LinkContactToCase = true`, vinculando o contato ao c
 
 #### 5.6.1 `edn-consultar-protocolo`
 
-- **Entrada:** `Details.Parameters.caseId` (UUID do caso, vindo de `$.Case.case_id`).
-- **Variável de ambiente:** `CASES_DOMAIN_ID`.
-- **Lógica:** valida o formato do UUID, chama `connectcases.get_case` pedindo `reference_number` e faz **até 3 tentativas** quando o caso ainda não está disponível (consistência eventual), com espera crescente (0,6 s e 1,2 s).
-- **Saída (STRING_MAP):** `status` (`SUCCESS`, `NOT_FOUND`, `ERROR`, `CONFIG_ERROR`) e `referenceNumber`.
+**Em palavras simples:** depois que o chamado é criado, esta função "pergunta" ao Connect Cases qual é o **número do protocolo** daquele chamado, para o assistente poder falar o número para o funcionário. Se o chamado ainda não apareceu no sistema, ela espera um pouco e tenta de novo (até 3 vezes).
+
+| Item | Detalhe |
+|---|---|
+| Quem chama | Fluxo do Connect (bloco *Invocar função AWS Lambda*) |
+| Recebe | `caseId` (ID do chamado criado) |
+| Devolve | `status` (`SUCCESS`, `NOT_FOUND`, `ERROR`, `CONFIG_ERROR`) e `referenceNumber` (o protocolo) |
+| Variável de ambiente | `CASES_DOMAIN_ID` |
+| Permissão IAM | `connectcases:GetCase` |
 
 ```python
+import os
+import re
+import time
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+cases = boto3.client(
+    "connectcases",
+    region_name="us-east-1",
+    config=Config(
+        connect_timeout=1,
+        read_timeout=2,
+        retries={"max_attempts": 1}
+    )
+)
+
 def lambda_handler(event, context):
     params = event.get("Details", {}).get("Parameters", {})
     case_id = params.get("caseId") or event.get("caseId")
     domain_id = os.environ.get("CASES_DOMAIN_ID", "")
 
-    if not case_id or not re.fullmatch(r"[0-9a-fA-F-]{36}", str(case_id)):
+    if not case_id or not re.fullmatch(
+        r"[0-9a-fA-F-]{36}", str(case_id)
+    ):
         return {"status": "ERROR", "referenceNumber": ""}
+
     if not domain_id:
         return {"status": "CONFIG_ERROR", "referenceNumber": ""}
 
     for attempt in range(3):
         try:
             response = cases.get_case(
-                domainId=domain_id, caseId=case_id,
+                domainId=domain_id,
+                caseId=case_id,
                 fields=[{"id": "reference_number"}]
             )
+
             for field in response.get("fields", []):
                 if field.get("id") == "reference_number":
-                    number = field.get("value", {}).get("stringValue", "")
+                    number = field.get("value", {}).get(
+                        "stringValue", ""
+                    )
                     if number:
-                        return {"status": "SUCCESS", "referenceNumber": str(number)}
+                        return {
+                            "status": "SUCCESS",
+                            "referenceNumber": str(number)
+                        }
+
             return {"status": "NOT_FOUND", "referenceNumber": ""}
+
         except cases.exceptions.ResourceNotFoundException:
             if attempt < 2:
                 time.sleep(0.6 * (attempt + 1))
                 continue
             return {"status": "NOT_FOUND", "referenceNumber": ""}
+
         except ClientError as error:
-            print("GetCase error:", error.response["Error"].get("Code", "Unknown"))
+            print("GetCase error:", error.response[
+                "Error"
+            ].get("Code", "Unknown"))
             return {"status": "ERROR", "referenceNumber": ""}
+
     return {"status": "NOT_FOUND", "referenceNumber": ""}
 ```
 
-**Permissão IAM necessária:** `connectcases:GetCase`.
-
 #### 5.6.2 `edn-validar-identidade-otp`
 
-- **Variáveis de ambiente:** `OTP_TABLE`, `SES_FROM_EMAIL`, `CUSTOMER_PROFILES_DOMAIN`, `OTP_HMAC_KEY` (mínimo 32 caracteres).
-- **Parâmetros recebidos do Connect:** `action` (`SEND_OTP` | `VERIFY_OTP`), `profileId`, `matricula` e, somente na verificação, `code`. O `ContactId` vem de `ContactData`.
-- **Permissões IAM:** `profile:BatchGetProfile`, `ses:SendEmail`, `dynamodb:GetItem/PutItem/UpdateItem/DeleteItem`.
-- **Constantes:** OTP válido por **300 s**, intervalo de **60 s** entre envios por funcionário, máximo de **3 tentativas**.
+**Em palavras simples:** garante que quem pede a recuperação de senha é mesmo o funcionário. Funciona em duas etapas: (1) **`SEND_OTP`** gera um código de 6 dígitos, guarda uma versão criptografada dele no DynamoDB e envia o código por e-mail; (2) **`VERIFY_OTP`** confere o código digitado pelo usuário. O código vale 5 minutos, só pode ser usado uma vez e o usuário tem no máximo 3 tentativas.
 
-| Ação | Comportamento | Possíveis `status` |
-|---|---|---|
-| `SEND_OTP` | Lê o perfil oficial (não aceita e-mail informado pelo contato), aplica *cooldown* por perfil, gera OTP de 6 dígitos com `secrets`, grava **apenas o hash HMAC-SHA256** (vinculado a `ContactId + profileId`) no DynamoDB e envia o e-mail pelo SES | `SENT`, `WAIT`, `UNAVAILABLE` |
-| `VERIFY_OTP` | Valida formato, existência, vínculo com perfil/matrícula, expiração e tentativas; compara com `hmac.compare_digest`; marca como usado com atualização condicional atômica | `VERIFIED`, `INVALID`, `EXPIRED`, `LOCKED`, `UNAVAILABLE` |
-
-Trecho central da verificação (uso único e anti-reutilização):
+| Item | Detalhe |
+|---|---|
+| Quem chama | Fluxo do Connect (somente; sem URL pública) |
+| Recebe | `action` (`SEND_OTP` ou `VERIFY_OTP`), `profileId`, `matricula` e, na verificação, `code` |
+| Devolve | `SENT`, `WAIT`, `VERIFIED`, `INVALID`, `EXPIRED`, `LOCKED` ou `UNAVAILABLE` |
+| Variáveis de ambiente | `OTP_TABLE`, `SES_FROM_EMAIL`, `CUSTOMER_PROFILES_DOMAIN`, `OTP_HMAC_KEY` (mínimo 32 caracteres) |
+| Permissões IAM | `profile:BatchGetProfile`, `ses:SendEmail`, `dynamodb:GetItem/PutItem/UpdateItem/DeleteItem` |
 
 ```python
-if hmac.compare_digest(challenge.get("digest", ""), _digest(contact_id, profile_id, otp)):
-    table.update_item(
-        Key={"challengeId": contact_id},
-        UpdateExpression="SET used = :yes",
-        ConditionExpression=(
-            "profileId = :profile AND accountNumber = :account "
-            "AND digest = :digest AND used = :no "
-            "AND attempts < :max AND expiresAt > :now"
-        ),
-        ...
+"""EDN Service Desk - verificacao OTP para Amazon Connect (laboratorio).
+
+Requisitos:
+- Lambda chamada exclusivamente pelo Connect (sem Function URL/API publica).
+- Ambiente: OTP_TABLE, SES_FROM_EMAIL, CUSTOMER_PROFILES_DOMAIN, OTP_HMAC_KEY.
+- IAM: profile:BatchGetProfile, ses:SendEmail, dynamodb:{GetItem,PutItem,UpdateItem,DeleteItem}.
+- Connect envia Details.Parameters.action, profileId e matricula; codigo somente em VERIFY_OTP.
+- A identidade nao deve ser tratada como autenticada sem status VERIFIED.
+
+Nunca registre o evento completo: ele pode conter o codigo OTP.
+"""
+
+import hashlib
+import hmac
+import logging
+import os
+import re
+import secrets
+import time
+
+import boto3
+from botocore.exceptions import ClientError
+
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+TABLE_NAME = os.environ.get("OTP_TABLE", "")
+SENDER = os.environ.get("SES_FROM_EMAIL", "")
+DOMAIN = os.environ.get("CUSTOMER_PROFILES_DOMAIN", "")
+HMAC_KEY = os.environ.get("OTP_HMAC_KEY", "")
+
+OTP_LIFETIME_SECONDS = 300
+PROFILE_COOLDOWN_SECONDS = 60
+MAX_ATTEMPTS = 3
+
+
+def _clients():
+    return (
+        boto3.resource("dynamodb", region_name=REGION).Table(TABLE_NAME),
+        boto3.client("customer-profiles", region_name=REGION),
+        boto3.client("ses", region_name=REGION),
     )
-    return _response("VERIFIED")
+
+
+def _response(status):
+    # Resposta simples e compativel com o atributo External de Lambda do Connect.
+    return {"status": status}
+
+
+def _digest(contact_id, profile_id, otp):
+    payload = f"{contact_id}:{profile_id}:{otp}".encode("utf-8")
+    return hmac.new(HMAC_KEY.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def _profile(profiles_client, profile_id, matricula):
+    # Nao aceita e-mail informado pelo contato: le o perfil oficial da AWS.
+    result = profiles_client.batch_get_profile(DomainName=DOMAIN, ProfileIds=[profile_id])
+    records = result.get("Profiles", [])
+    if len(records) != 1 or records[0].get("ProfileId") != profile_id:
+        return None
+    profile = records[0]
+    if str(profile.get("AccountNumber") or "") != matricula:
+        return None
+    return profile
+
+
+def _send(event, table, profiles_client, ses_client, now, contact_id, profile_id, matricula):
+    if not re.fullmatch(r"\d{4}", matricula):
+        return _response("UNAVAILABLE")
+
+    profile = _profile(profiles_client, profile_id, matricula)
+    if not profile:
+        return _response("UNAVAILABLE")
+
+    # Preferir e-mail de recuperacao independente da conta corporativa bloqueada.
+    address = (profile.get("PersonalEmailAddress") or profile.get("EmailAddress") or "").strip()
+    if not address or "@" not in address:
+        return _response("UNAVAILABLE")
+
+    # Limite minimo entre envios por funcionario, inclusive em contatos distintos.
+    rate_id = f"RATE#{profile_id}"
+    try:
+        table.put_item(
+            Item={"challengeId": rate_id, "expiresAt": now + PROFILE_COOLDOWN_SECONDS},
+            ConditionExpression="attribute_not_exists(challengeId) OR expiresAt <= :now",
+            ExpressionAttributeValues={":now": now},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return _response("WAIT")
+        raise
+
+    otp = f"{secrets.randbelow(1000000):06d}"
+    try:
+        # Chave vinculada ao ContactId; um codigo de outro chat nao sera aceito.
+        table.put_item(
+            Item={
+                "challengeId": contact_id,
+                "profileId": profile_id,
+                "accountNumber": matricula,
+                "digest": _digest(contact_id, profile_id, otp),
+                "attempts": 0,
+                "used": False,
+                "expiresAt": now + OTP_LIFETIME_SECONDS,
+            },
+            ConditionExpression="attribute_not_exists(challengeId) OR expiresAt <= :now",
+            ExpressionAttributeValues={":now": now},
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return _response("WAIT")
+        raise
+
+    try:
+        # Mensagem montada separadamente para evitar erros de chaves aninhadas.
+        body_text = (
+            f"Seu codigo de verificacao e: {otp}\n\n"
+            "Valido por 5 minutos e para uso unico. "
+            "Nao compartilhe com atendentes ou terceiros.\n\n"
+            "Se voce nao solicitou esta verificacao, ignore este e-mail."
+        )
+        subject = {
+            "Data": "Codigo de verificacao - Service Desk de TI",
+            "Charset": "UTF-8",
+        }
+        body = {
+            "Text": {
+                "Data": body_text,
+                "Charset": "UTF-8",
+            }
+        }
+        message = {"Subject": subject, "Body": body}
+        ses_client.send_email(
+            Source=SENDER,
+            Destination={"ToAddresses": [address]},
+            Message=message,
+        )
+    except ClientError as exc:
+        # Diagnostico sem expor e-mail, OTP, evento ou mensagem integral do SES.
+        error = exc.response.get("Error", {})
+        error_code = str(error.get("Code") or "Unknown")
+        description = str(error.get("Message") or "").lower()
+        if "not verified" in description or "not verified" in error_code.lower():
+            category = "IDENTITY_NOT_VERIFIED"
+        elif "not authorized" in description or "access denied" in description or "accessdenied" in error_code.lower():
+            category = "IAM_DENIED"
+        elif "sandbox" in description:
+            category = "SES_SANDBOX"
+        elif "sending paused" in description or "account is paused" in description:
+            category = "SES_SENDING_PAUSED"
+        else:
+            category = "SES_OTHER"
+        # Logue apenas metadados seguros do AccessDenied, nunca o erro integral.
+        # A mensagem do SES pode revelar destinatario ou identidade do remetente.
+        reason_keys = (
+            ("service control policy", "SCP"),
+            ("organization policy", "ORGANIZATION_POLICY"),
+            ("permissions boundary", "PERMISSIONS_BOUNDARY"),
+            ("session policy", "SESSION_POLICY"),
+            ("vpc endpoint policy", "VPC_ENDPOINT_POLICY"),
+            ("resource-based policy", "RESOURCE_POLICY"),
+            ("identity-based policy", "IDENTITY_POLICY"),
+            ("explicit deny", "EXPLICIT_DENY"),
+            ("no policy allows", "NO_MATCHING_ALLOW"),
+            ("not authorized", "NOT_AUTHORIZED_UNSPECIFIED"),
+        )
+        reason = next((name for phrase, name in reason_keys if phrase in description), "NOT_STATED")
+        denied_action = re.search(r"ses:(SendEmail|SendRawEmail|SendBulkEmail)", description, re.I)
+        arn_match = re.search(
+            r"arn:aws:ses:([a-z0-9-]+):([0-9]{12}):(identity|configuration-set)/([^\s,;\"']+)",
+            description, re.I,
+        )
+        resource_kind = arn_match.group(3) if arn_match else "UNSTATED"
+        # Diagnostico de recurso: so indicadores, nunca valores de e-mail ou OTP.
+        # Permite diferenciar ARN do remetente, ARN do destinatario e dominio.
+        if arn_match and resource_kind == "identity":
+            denied_identity = arn_match.group(4).rstrip(".>)").strip().lower()
+            identity_matches_sender = denied_identity == SENDER.strip().lower()
+            identity_matches_recipient = denied_identity == address.strip().lower()
+            denied_identity_is_domain = "@" not in denied_identity
+            denied_region_matches = arn_match.group(1).lower() == REGION.lower()
+            denied_account_matches = arn_match.group(2) == "<ID_DA_CONTA_AWS>"
+        else:
+            identity_matches_sender = "UNKNOWN"
+            identity_matches_recipient = "UNKNOWN"
+            denied_identity_is_domain = "UNKNOWN"
+            denied_region_matches = "UNKNOWN"
+            denied_account_matches = "UNKNOWN"
+        sender_has_extra_spaces = SENDER != SENDER.strip()
+        request_id = (exc.response.get("ResponseMetadata") or {}).get("RequestId", "UNSTATED")
+        table.delete_item(Key={"challengeId": contact_id})
+        log.warning(
+            "SES_SEND_FAILED code=%s category=%s reason=%s denied_action=%s "
+            "resource_type=%s matches_sender=%s matches_recipient=%s "
+            "is_domain=%s region_ok=%s account_ok=%s sender_spaces=%s request_region=%s aws_request_id=%s",
+            error_code, category, reason,
+            denied_action.group(0) if denied_action else "UNSTATED",
+            resource_kind, identity_matches_sender, identity_matches_recipient,
+            denied_identity_is_domain, denied_region_matches, denied_account_matches,
+            sender_has_extra_spaces, REGION, request_id,
+        )
+        return _response("UNAVAILABLE")
+
+    return _response("SENT")
+
+
+def _verify(params, table, now, contact_id, profile_id, matricula):
+    otp = str(params.get("code") or "").strip()
+    if not re.fullmatch(r"\d{6}", otp):
+        return _response("INVALID")
+
+    result = table.get_item(Key={"challengeId": contact_id}, ConsistentRead=True)
+    challenge = result.get("Item")
+    if not challenge:
+        return _response("UNAVAILABLE")
+
+    if (challenge.get("profileId") != profile_id
+            or challenge.get("accountNumber") != matricula
+            or challenge.get("used") is True):
+        return _response("UNAVAILABLE")
+
+    if int(challenge.get("expiresAt", 0)) <= now:
+        return _response("EXPIRED")
+    if int(challenge.get("attempts", 0)) >= MAX_ATTEMPTS:
+        return _response("LOCKED")
+
+    if hmac.compare_digest(challenge.get("digest", ""), _digest(contact_id, profile_id, otp)):
+        try:
+            # Atualizacao condicional atomica impede reutilizacao da mesma prova.
+            table.update_item(
+                Key={"challengeId": contact_id},
+                UpdateExpression="SET used = :yes",
+                ConditionExpression=(
+                    "profileId = :profile AND accountNumber = :account "
+                    "AND digest = :digest AND used = :no "
+                    "AND attempts < :max AND expiresAt > :now"
+                ),
+                ExpressionAttributeValues={
+                    ":profile": profile_id,
+                    ":account": matricula,
+                    ":digest": challenge["digest"],
+                    ":yes": True,
+                    ":no": False,
+                    ":max": MAX_ATTEMPTS,
+                    ":now": now,
+                },
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return _response("UNAVAILABLE")
+            raise
+        return _response("VERIFIED")
+
+    try:
+        result = table.update_item(
+            Key={"challengeId": contact_id},
+            UpdateExpression="ADD attempts :one",
+            ConditionExpression=(
+                "profileId = :profile AND accountNumber = :account AND used = :no "
+                "AND attempts < :max AND expiresAt > :now"
+            ),
+            ExpressionAttributeValues={
+                ":one": 1,
+                ":profile": profile_id,
+                ":account": matricula,
+                ":no": False,
+                ":max": MAX_ATTEMPTS,
+                ":now": now,
+            },
+            ReturnValues="UPDATED_NEW",
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return _response("LOCKED")
+        raise
+    attempts = int(result.get("Attributes", {}).get("attempts", MAX_ATTEMPTS))
+    return _response("LOCKED" if attempts >= MAX_ATTEMPTS else "INVALID")
+
+
+def lambda_handler(event, context):
+    if not (TABLE_NAME and SENDER and DOMAIN and len(HMAC_KEY) >= 32):
+        log.error("Configuracao de ambiente incompleta.")
+        return _response("UNAVAILABLE")
+
+    details = event.get("Details") or {}
+    params = details.get("Parameters") or {}
+    contact = details.get("ContactData") or {}
+    action = str(params.get("action") or "").upper()
+    contact_id = str(contact.get("ContactId") or "").strip()
+    profile_id = str(params.get("profileId") or "").strip()
+    matricula = str(params.get("matricula") or "").strip()
+    if not contact_id or not profile_id or not re.fullmatch(r"\d{4}", matricula):
+        return _response("UNAVAILABLE")
+    if action not in ("SEND_OTP", "VERIFY_OTP"):
+        return _response("UNAVAILABLE")
+
+    now = int(time.time())
+    try:
+        table, profiles_client, ses_client = _clients()
+        if action == "SEND_OTP":
+            return _send(event, table, profiles_client, ses_client, now, contact_id, profile_id, matricula)
+        return _verify(params, table, now, contact_id, profile_id, matricula)
+    except Exception:
+        # Nunca imprimir o evento ou codigo recebido no log.
+        log.exception("Falha operacional da verificacao OTP.")
+        return _response("UNAVAILABLE")
 ```
 
-> O código-fonte completo está em `Códigos_Lambda/` (ver [seção 13](#13-estrutura-do-repositório)).
+> O ID da conta AWS que aparecia no código original foi substituído por `<ID_DA_CONTA_AWS>`.
 
-#### 5.6.3 Validação de matrícula (Lex *code hook*)
+#### 5.6.3 Validação de matrícula (*code hook* do Lex)
 
-- **Variável de ambiente:** `CUSTOMER_PROFILES_DOMAIN`. **Permissão:** `profile:SearchProfiles`.
-- Regras: matrícula deve casar `^[0-9]{4}$`; busca por `_account`; se não encontrar → pede novamente (`ElicitSlot`); se houver mais de um resultado → encerra com "Cadastro ambíguo".
-- Em caso de sucesso, grava nos *session attributes*: `matriculaValidada`, `nomeFuncionario` e `perfilId`, e devolve `Delegate`.
+**Em palavras simples:** é o "porteiro" da matrícula. Quando o usuário digita a matrícula no chat ou na voz, o Lex chama esta função para conferir se tem **4 números** e se existe no cadastro de funcionários (Customer Profiles). Se estiver errada, ela pede para digitar de novo. Se estiver certa, ela guarda o nome e o ID do perfil da conversa e deixa o Lex seguir.
+
+| Item | Detalhe |
+|---|---|
+| Quem chama | Amazon Lex V2 (*code hook* do slot `MatriculaFuncionario`) |
+| Recebe | Evento do Lex com o valor do slot |
+| Devolve | Resposta do Lex: `ElicitSlot` (pede de novo), `Delegate` (segue) ou `Close` (erro) |
+| Grava na sessão | `matriculaValidada`, `nomeFuncionario`, `perfilId` |
+| Variável de ambiente | `CUSTOMER_PROFILES_DOMAIN` |
+| Permissão IAM | `profile:SearchProfiles` |
+
+```python
+import os
+import re
+import boto3
+import logging
+from botocore.exceptions import ClientError, BotoCoreError
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+profiles = boto3.client("customer-profiles")
+
+
+def lambda_handler(event, context):
+    estado = event.get("sessionState") or {}
+    intent = estado.get("intent") or {}
+    slots = intent.get("slots") or {}
+    atributos = estado.get("sessionAttributes") or {}
+
+    campo = slots.get("MatriculaFuncionario") or {}
+    valor = campo.get("value") or {}
+    matricula = str(valor.get("interpretedValue") or "").strip()
+
+    def resposta(acao, mensagem=None):
+        resultado = {
+            "sessionState": {
+                "dialogAction": acao,
+                "intent": intent,
+                "sessionAttributes": atributos
+            }
+        }
+        if mensagem:
+            resultado["messages"] = [{
+                "contentType": "PlainText",
+                "content": mensagem
+            }]
+        return resultado
+
+    def pedir_matricula(mensagem):
+        slots["MatriculaFuncionario"] = None
+        intent["slots"] = slots
+        intent["state"] = "InProgress"
+        return resposta(
+            {
+                "type": "ElicitSlot",
+                "slotToElicit": "MatriculaFuncionario"
+            },
+            mensagem
+        )
+
+    if not re.fullmatch(r"[0-9]{4}", matricula):
+        return pedir_matricula(
+            "Informe uma matricula de quatro numeros."
+        )
+
+    dominio = os.environ.get("CUSTOMER_PROFILES_DOMAIN")
+
+    if not dominio:
+        logger.error("Dominio nao configurado")
+        intent["state"] = "Failed"
+        return resposta(
+            {"type": "Close"},
+            "Sistema de validacao indisponivel."
+        )
+
+    try:
+        consulta = profiles.search_profiles(
+            DomainName=dominio,
+            KeyName="_account",
+            Values=[matricula],
+            MaxResults=20
+        )
+    except (ClientError, BotoCoreError):
+        logger.exception("Erro na consulta de perfis")
+        intent["state"] = "Failed"
+        return resposta(
+            {"type": "Close"},
+            "Nao foi possivel validar seu cadastro."
+        )
+
+    encontrados = [
+        perfil for perfil in consulta.get("Items", [])
+        if perfil.get("AccountNumber") == matricula
+    ]
+
+    if not encontrados:
+        return pedir_matricula(
+            "Matricula nao encontrada. Tente novamente."
+        )
+
+    if len(encontrados) != 1 or consulta.get("NextToken"):
+        intent["state"] = "Failed"
+        return resposta(
+            {"type": "Close"},
+            "Cadastro ambiguo. Contate o suporte."
+        )
+
+    funcionario = encontrados[0]
+
+    nome = " ".join(filter(None, [
+        funcionario.get("FirstName"),
+        funcionario.get("MiddleName"),
+        funcionario.get("LastName")
+    ]))
+
+    atributos["matriculaValidada"] = matricula
+    atributos["nomeFuncionario"] = nome
+    atributos["perfilId"] = funcionario.get("ProfileId", "")
+
+    return resposta({"type": "Delegate"})
+```
 
 #### 5.6.4 Validação JWT do widget de chat
 
-- Só responde se a requisição vier de um **API Gateway com autorizador JWT** (claim `sub`); caso contrário retorna `401`.
-- Gera um token **HS256** com validade de 5 minutos, assinado com o segredo do widget (`CONNECT_WIDGET_SECRET`, variável de ambiente) e devolve `{"data": "<token>"}` sem cache.
+**Em palavras simples:** gera uma "senha temporária" (token) de 5 minutos para o **widget de chat** do site conseguir abrir uma conversa com o Connect. Só entrega o token se quem pediu estiver autenticado no API Gateway; caso contrário responde "autenticação obrigatória" (erro 401).
 
-#### 5.6.5 Função auxiliar (CloudFormation)
+| Item | Detalhe |
+|---|---|
+| Quem chama | Amazon API Gateway com autorizador JWT |
+| Devolve | `{"data": "<token>"}` (válido por 300 s) ou erro 401/500 |
+| Variável de ambiente | `CONNECT_WIDGET_SECRET` |
 
-*Custom resource* que cria o *alias* da conta IAM a partir de prefixo/nome da conta, tratando conflito de nomes anexando o ID da conta. Em `Delete` nunca falha, para não travar a remoção da stack.
+```python
+import os
+import json
+import time
+import hmac
+import hashlib
+import base64
+
+WIDGET_ID = "<ID_DO_WIDGET_DO_CONNECT>"
+TOKEN_VALIDITY_SECONDS = 300  # 5 minutos
+
+
+def encode_base64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def create_token(secret):
+    now = int(time.time())
+
+    header = {
+        "alg": "HS256",
+        "typ": "JWT"
+    }
+
+    payload = {
+        "sub": WIDGET_ID,
+        "iat": now,
+        "exp": now + TOKEN_VALIDITY_SECONDS
+    }
+
+    header_encoded = encode_base64url(
+        json.dumps(header, separators=(",", ":")).encode()
+    )
+
+    payload_encoded = encode_base64url(
+        json.dumps(payload, separators=(",", ":")).encode()
+    )
+
+    content = f"{header_encoded}.{payload_encoded}"
+
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        content.encode("ascii"),
+        hashlib.sha256
+    ).digest()
+
+    return f"{content}.{encode_base64url(signature)}"
+
+
+def lambda_handler(event, context):
+    # Exige que a chamada venha de uma API Gateway
+    # configurada com autorizador JWT.
+    request_context = event.get("requestContext") or {}
+    authorizer = request_context.get("authorizer") or {}
+    jwt_context = authorizer.get("jwt") or {}
+    claims = jwt_context.get("claims") or {}
+
+    if not isinstance(claims, dict) or not claims.get("sub"):
+        return {
+            "statusCode": 401,
+            "headers": {"Cache-Control": "no-store"},
+            "body": json.dumps({
+                "error": "Autenticacao obrigatoria"
+            })
+        }
+
+    secret = os.environ.get("CONNECT_WIDGET_SECRET")
+
+    if not secret:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": "Configuracao indisponivel"
+            })
+        }
+
+    token = create_token(secret)
+
+    return {
+        "statusCode": 200,
+        "headers": {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store"
+        },
+        "body": json.dumps({"data": token})
+    }
+```
+
+> O ID do widget do código original foi substituído por `<ID_DO_WIDGET_DO_CONNECT>`.
+
+#### 5.6.5 Função auxiliar do CloudFormation (alias da conta IAM)
+
+**Em palavras simples:** é uma função de apoio à infraestrutura, e não do atendimento. Quando o CloudFormation cria a stack, ela define um **apelido (alias) para a conta AWS**, usado no endereço de login do console. Se o nome já estiver em uso por outra conta no mundo, ela acrescenta o ID da conta. Ao apagar a stack, ela remove o alias sem travar a exclusão.
+
+| Item | Detalhe |
+|---|---|
+| Quem chama | CloudFormation (*custom resource*) |
+| Recebe | `Prefixo`, `UsarNomeDaConta`, `AnexarId` |
+| Devolve | Alias criado (`Alias`) ou erro, via `cfnresponse` |
+| Permissões IAM | `iam:ListAccountAliases`, `iam:CreateAccountAlias`, `iam:DeleteAccountAlias`, `account:GetAccountInformation` |
+
+```python
+import re
+import unicodedata
+
+import boto3
+import cfnresponse
+
+iam = boto3.client("iam")
+account = boto3.client("account")
+
+
+def slug(texto):
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+    texto = re.sub(r"[^a-z0-9]+", "-", texto.lower())
+    return texto.strip("-")
+
+
+def montar_alias(prefixo, nome, account_id, com_id):
+    base = "-".join(p for p in (slug(prefixo), slug(nome)) if p)
+    if com_id or len(base) < 3:
+        base = base[:50].strip("-") or "conta"
+        return base + "-" + account_id
+    return base[:63].strip("-")
+
+
+def handler(event, context):
+    tipo = event["RequestType"]
+    props = event.get("ResourceProperties", {})
+    physical_id = event.get("PhysicalResourceId") or context.log_stream_name
+    account_id = context.invoked_function_arn.split(":")[4]
+    try:
+        existentes = iam.list_account_aliases().get("AccountAliases", [])
+
+        if tipo == "Delete":
+            if physical_id in existentes:
+                iam.delete_account_alias(AccountAlias=physical_id)
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+            return
+
+        nome = ""
+        if props.get("UsarNomeDaConta") == "true":
+            if not hasattr(account, "get_account_information"):
+                raise RuntimeError("boto3 do runtime nao tem account.get_account_information")
+            nome = account.get_account_information()["AccountName"]
+
+        prefixo = props.get("Prefixo", "")
+        forcar_id = props.get("AnexarId") == "true"
+        alias = montar_alias(prefixo, nome, account_id, forcar_id)
+        alias_com_id = montar_alias(prefixo, nome, account_id, True)
+
+        # se a conta ja tem um dos dois, mantem
+        atual = next((a for a in (alias, alias_com_id) if a in existentes), None)
+        if atual:
+            alias = atual
+        else:
+            # a conta so pode ter 1 alias: remove o atual (se houver) antes de criar
+            for velho in existentes:
+                iam.delete_account_alias(AccountAlias=velho)
+            try:
+                iam.create_account_alias(AccountAlias=alias)
+            except iam.exceptions.EntityAlreadyExistsException:
+                # alias ja usado por outra conta no mundo: tenta com o ID da conta
+                alias = alias_com_id
+                iam.create_account_alias(AccountAlias=alias)
+
+        cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Alias": alias}, alias)
+    except Exception as e:
+        print("Erro:", repr(e))
+        # no Delete nunca falha, para nao travar a remocao da stack
+        status = cfnresponse.SUCCESS if tipo == "Delete" else cfnresponse.FAILED
+        cfnresponse.send(event, context, status, {"Error": str(e)}, physical_id)
+```
 
 ### 5.7 OTP: DynamoDB e SES
 
