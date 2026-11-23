@@ -31,7 +31,32 @@
 13. [Estrutura do repositório](#13-estrutura-do-repositório)
 
 ---
+## Resumo executivo
 
+Este projeto implementa um **service desk de TI omnichannel (chat + voz)** no **Amazon Connect** para uma empresa de médio porte, substituindo um help desk sem triagem, em que os colaboradores abriam chamados por e-mail ou ramal, o que gerava fila, falta de priorização e pouca visibilidade dos indicadores.
+
+Um assistente virtual criado com **Amazon Lex V2** (`ServiceDeskTI-Bot`, em pt-BR) identifica o motivo do contato e conduz o atendimento de ponta a ponta:
+
+- **Triagem por intenção:** `PasswordReset`, `NetworkIssue`, `HardwareRequest` e `ConsultarChamado`, além de `OutOfScope` para assuntos fora do escopo.
+- **Validação do funcionário** pela matrícula, consultando o **Customer Profiles**.
+- **Verificação por OTP** na recuperação de senha: código de 6 dígitos enviado por e-mail (**SES**), validado por **Lambda** com hash armazenado no **DynamoDB**, válido por 5 minutos, de uso único e com no máximo 3 tentativas.
+- **Abertura automática do chamado** no **Connect Cases**, com categoria e prioridade (Alta para senha, Média para rede e hardware), e informação do **protocolo** ao usuário.
+- **Roteamento para a fila correta:** `Fila-Seguranca`, `Fila-Redes` ou `Fila-Hardware`.
+- **Consulta de status** de chamados existentes pelo número de protocolo.
+- **Análise de qualidade** com **Contact Lens** (transcrição, sentimento e gravação de voz) e armazenamento no **S3**.
+
+O fluxo trata falhas de forma explícita: matrícula não encontrada, erro ao criar o caso ou ler o protocolo, OTP inválido, fila lotada e erros gerais sempre terminam em transferência para um atendente ou em um encerramento com mensagem clara.
+
+**Resultados esperados:** menor TMA, maior taxa de resolução no primeiro contato (FCR), chamados categorizados e priorizados desde a entrada e indicadores disponíveis para o supervisor.
+
+| Indicador | Valor |
+|---|---|
+| Intenções configuradas no Lex | 6 (4 de atendimento, 1 de captura de OTP e 1 fora de escopo) |
+| Filas de atendimento | 3 |
+| Canais | Chat e voz |
+| Região | `us-east-1` |
+| Custo estimado | US$ 11.146/mês (cerca de US$ 0,37 por ligação) |
+---
 ## 1. Tecnologias utilizadas
 
 | Tecnologia | Papel no projeto |
