@@ -113,30 +113,61 @@ A solução é um **service desk omnichannel** (chat online + voz) em que um ass
 
 ## 4. Arquitetura
 
-![Arquitetura geral da solução](imagem/01_arquitetura_geral.png)
+![Arquitetura geral da solução](imagem/fluxo.png)
 
 > 📸 **Imagem 01 — Arquitetura geral:** diagrama (draw.io, Lucidchart ou print do PDF) mostrando Connect, Lex, Lambdas, Customer Profiles, Cases, DynamoDB, SES, S3 e CloudWatch.
 
 ```mermaid
-flowchart LR
-    U[Funcionário<br/>chat ou voz] --> C[Amazon Connect<br/>fluxo de contato]
-    C <--> L[Amazon Lex V2<br/>ServiceDeskTI-Bot]
-    L --> LM[Lambda<br/>validação de matrícula]
-    LM --> CP[(Customer Profiles)]
-    C --> CP
-    C --> LO[Lambda<br/>edn-validar-identidade-otp]
-    LO --> DDB[(DynamoDB<br/>desafios OTP)]
-    LO --> SES[Amazon SES]
-    C --> CS[Connect Cases<br/>template ServiceDeskTI]
-    C --> LP[Lambda<br/>edn-consultar-protocolo]
-    LP --> CS
-    C --> Q{{Filas}}
-    Q --> QS[Fila-Seguranca]
-    Q --> QR[Fila-Redes]
-    Q --> QH[Fila-Hardware]
-    C --> CL[Contact Lens]
-    CL --> S3[(S3<br/>gravações e análises)]
-    C -.logs.-> CW[CloudWatch Logs]
+flowchart TD
+    A(["Contato entra (voz ou chat)"]) --> B["Ativa logs do fluxo, gravação e Contact Lens"]
+    B --> C["Define voz Ana Paula e idioma pt-BR"]
+    C --> D{{"Triagem com Amazon Lex"}}
+
+    D -->|"PasswordReset"| S1["Busca perfil pela matrícula"]
+    D -->|"NetworkIssue"| R1["Busca perfil pela matrícula"]
+    D -->|"HardwareRequest"| H1["Busca perfil pela matrícula"]
+    D -->|"ConsultarChamado"| K1["Busca perfil pela matrícula"]
+    D -->|"OutOfScope ou sem correspondência"| X(["Encerra o contato"])
+
+    S1 -->|"encontrou"| S2["Lambda envia OTP por e-mail"]
+    S1 -->|"não encontrou ou erro"| QS
+    S2 --> S3{"Canal"}
+    S3 -->|"Voz"| S4["Cliente digita 6 dígitos (DTMF)"]
+    S3 -->|"Chat"| S5["Lex coleta o código"]
+    S4 --> S6["Lambda verifica OTP"]
+    S5 --> S6
+    S6 --> S7{"Código válido?"}
+    S7 -->|"sim"| S8["Cria case (prioridade Alta)"]
+    S7 -->|"não"| S9["Aviso: identidade não confirmada"] --> X
+    S8 --> S10["Lambda consulta o protocolo"]
+    S10 --> S11["Informa o protocolo"]
+    S11 --> QS
+    S8 -->|"falha"| S12["Aviso de falha no registro"] --> QS
+
+    R1 -->|"encontrou"| R2["Cria case (prioridade Média)"]
+    R1 -->|"não encontrou, duplicado ou erro"| QR
+    R2 --> R3["Lambda consulta o protocolo"]
+    R3 --> R4["Informa o protocolo"]
+    R4 --> QR
+
+    H1 -->|"encontrou"| H2["Cria case (prioridade Média)"]
+    H1 -->|"não encontrou, duplicado ou erro"| QH
+    H2 --> H3["Lambda consulta o protocolo"]
+    H3 --> H4["Informa o protocolo"]
+    H4 --> QH
+
+    K1 -->|"encontrou"| K2["Busca o case por protocolo e perfil"]
+    K1 -->|"não encontrou, duplicado ou erro"| K4["Mensagem de erro"] --> X
+    K2 --> K3{"Status"}
+    K3 -->|"open"| K5["Informa: Aberto"] --> X
+    K3 -->|"closed"| K6["Informa: Encerrado"] --> X
+    K3 -->|"outro"| K7["Informa o status recebido"] --> X
+    K2 -->|"não encontrou ou erro"| K4
+
+    QS["Define fila Segurança"] --> T
+    QR["Define fila Infraestrutura e Redes"] --> T
+    QH["Define fila Hardware"] --> T
+    T["Transfere para a fila"] -->|"fila sem capacidade"| Z["Aviso de indisponibilidade"] --> X
 ```
 
 ---
@@ -178,7 +209,7 @@ flowchart LR
 - Cada fila possui horário de funcionamento, número de contato de saída e **perfil de roteamento** com os canais Chat e Voz.
 - No fluxo, o bloco **Definir fila de trabalho** (`UpdateContactTargetQueue`) escolhe a fila e o bloco **Transferir para fila** (`TransferContactToQueue`) envia o contato ao atendente.
 
-![Filas criadas no Amazon Connect](imagem/03_filas_connect.png)
+![Filas criadas no Amazon Connect](imagem/Queues.png)
 
 > 📸 **Imagem 03 — Filas:** Routing → Queues, mostrando `Fila-Seguranca`, `Fila-Redes` e `Fila-Hardware`.
 
@@ -197,7 +228,7 @@ Template **`ServiceDeskTI`** com os campos usados pelo fluxo:
 
 O bloco **Criar caso** usa `LinkContactToCase = true`, vinculando o contato ao chamado.
 
-![Template e campos do Connect Cases](imagem/04_cases_template.png)
+![Template e campos do Connect Cases](imagem/Case_template.png)
 
 > 📸 **Imagem 04 — Cases:** Cases → Templates → `ServiceDeskTI` com os campos listados acima.
 
@@ -217,15 +248,15 @@ O bloco **Criar caso** usa `LinkContactToCase = true`, vinculando o contato ao c
 - O **code hook de diálogo** do slot de matrícula chama a Lambda de validação (ver 5.6), que exige 4 dígitos e confirma a existência no Customer Profiles.
 - O bot possui **alias** associado à instância do Connect (permissão de invocação concedida em *Flows → Amazon Lex*).
 
-![Intenções do bot ServiceDeskTI-Bot](imagem/05_lex_intencoes.png)
+![Intenções do bot ServiceDeskTI-Bot](imagem/botLex2.png)
 
-> 📸 **Imagem 05 — Lex, lista de intenções:** Console Lex V2 → `ServiceDeskTI-Bot` → idioma pt-BR → Intents.
+> 📸 **Imagem 05 — Lex, Intenções:** Console Lex V2 → `ServiceDeskTI-Bot` → idioma pt-BR → Intents.
 
-![Slots e frases de exemplo da intenção PasswordReset](imagem/06_lex_slots_passwordreset.png)
+![Slots e frases de exemplo da intenção PasswordReset](imagem/botLex3.png)
 
 > 📸 **Imagem 06 — Lex, detalhe de intenção:** `PasswordReset` com *sample utterances*, slot `MatriculaFuncionario` e o *code hook* habilitado.
 
-![Alias do bot e integração com o Connect](imagem/07_lex_alias_connect.png)
+![Alias do bot e integração com o Connect](imagem/botLex.png)
 
 > 📸 **Imagem 07 — Lex, alias e integração:** alias do bot e tela *Amazon Connect → Flows → Amazon Lex* com o bot adicionado.
 
@@ -243,7 +274,7 @@ O bloco **Criar caso** usa `LinkContactToCase = true`, vinculando o contato ao c
 
 > 📸 **Imagem 08 — Lambda `edn-consultar-protocolo`:** visão geral da função no console (arquivo já existente: `imagem/Lambda_Consultar_Protocolo.png`).
 
-![Variáveis de ambiente e permissões das Lambdas](imagem/09_lambda_config_permissoes.png)
+![Variáveis de ambiente e permissões das Lambdas](imagem/Lambda_Consultar_Protocolo2.png)
 
 > 📸 **Imagem 09 — Lambda, configuração:** aba *Configuration* → *Environment variables* e *Permissions* (oculte valores secretos antes do print).
 
@@ -974,7 +1005,7 @@ def handler(event, context):
 
 **Amazon SES:** identidade do remetente verificada (`SES_FROM_EMAIL`). Em conta *sandbox*, o destinatário também precisa estar verificado.
 
-![Tabela DynamoDB de OTP e identidade verificada no SES](imagem/10_dynamodb_ses_otp.png)
+![Tabela DynamoDB de OTP e identidade verificada no SES](imagem/dynamodb.png)
 
 > 📸 **Imagem 10 — OTP:** tabela DynamoDB (itens/atributos) e identidade verificada no SES. Não exponha e-mails reais nem códigos.
 
@@ -1087,9 +1118,7 @@ flowchart TD
 | Fila lotada (`QueueAtCapacity`) | Mensagem de indisponibilidade e encerramento |
 | Erro geral / erro de triagem | Mensagem de dificuldade técnica e encerramento |
 
-![Teste de falha: matrícula inexistente ou OTP inválido](imagem/15_teste_falhas.png)
 
-> 📸 **Imagem 15 — Cenário de falha:** conversa de chat com matrícula inexistente e/ou OTP incorreto, mostrando a mensagem de tratamento.
 
 ---
 
@@ -1139,11 +1168,11 @@ O supervisor acompanha os indicadores em **Analytics and optimization** (dashboa
 | 8 | Assunto fora do escopo | Chat | Encerra o contato |
 | 9 | Matrícula inexistente | Chat | Aviso e transferência para a fila da equipe |
 
-![Conversa de chat com abertura de chamado e protocolo](imagem/17_teste_chat_protocolo.png)
+![Conversa de chat com abertura de chamado e protocolo](imagem/teste.png)
 
 > 📸 **Imagem 17 — Teste de chat:** conversa completa (intenção → matrícula → OTP → protocolo → transferência).
 
-![Caso criado no Connect Cases](imagem/18_caso_criado.png)
+![Caso criado no Connect Cases](imagem/case.png)
 
 > 📸 **Imagem 18 — Caso criado:** tela do caso no Connect Cases mostrando categoria, prioridade, fila e protocolo.
 
@@ -1167,38 +1196,10 @@ Premissas do dimensionamento: ~214.500 minutos de voz/mês, ~18.700 casos/mês e
 
 **Custo por ligação:** US$ 0,37 (total ÷ ligações por mês).
 
----
-
-## 12. Lista de imagens
-
-Salve os prints na pasta `imagem/` com **exatamente** estes nomes:
-
-| # | Arquivo | O que capturar |
-|---|---|---|
-| 01 | `imagem/01_arquitetura_geral.png` | Diagrama de arquitetura |
-| 02 | `imagem/02_instancia_connect.png` | Instância do Amazon Connect |
-| 03 | `imagem/03_filas_connect.png` | Filas de atendimento |
-| 04 | `imagem/04_cases_template.png` | Template do Connect Cases |
-| 05 | `imagem/05_lex_intencoes.png` | Intenções do Lex |
-| 06 | `imagem/06_lex_slots_passwordreset.png` | Slots e utterances (PasswordReset) |
-| 07 | `imagem/07_lex_alias_connect.png` | Alias do bot e integração com o Connect |
-| 08 | `imagem/Lambda_Consultar_Protocolo.png` | Lambda `edn-consultar-protocolo` *(já existe)* |
-| 09 | `imagem/09_lambda_config_permissoes.png` | Variáveis de ambiente e permissões |
-| 10 | `imagem/10_dynamodb_ses_otp.png` | DynamoDB e SES |
-| 11 | `imagem/11_contact_lens_config.png` | Contact Lens |
-| 12 | `imagem/12_fluxo_visao_geral.png` | Fluxo completo |
-| 13 | `imagem/13_fluxo_ramo_otp.png` | Ramo de recuperação de senha |
-| 14 | `imagem/14_fluxo_criar_caso.png` | Bloco "Criar caso" |
-| 15 | `imagem/15_teste_falhas.png` | Teste de falhas |
-| 16 | `imagem/16_metricas_supervisor.png` | Métricas FCR/TMA |
-| 17 | `imagem/17_teste_chat_protocolo.png` | Teste de chat |
-| 18 | `imagem/18_caso_criado.png` | Caso criado no Cases |
-
-> 🔒 **Antes de publicar os prints:** oculte ID da conta AWS, ARNs, e-mails reais, matrículas reais, chaves/segredos e códigos OTP.
 
 ---
 
-## 13. Estrutura do repositório
+## 12. Estrutura do repositório
 
 ```text
 .
